@@ -1,8 +1,11 @@
 package xlsx
 
 import (
+	"fmt"
 	"reflect"
+	"regexp"
 	"strconv"
+	"strings"
 
 	"github.com/gsdocker/gserrors"
 	"github.com/gsdocker/gslogger"
@@ -41,19 +44,27 @@ func (e *ErrInvalidUnmarshal) Error() string {
 
 // RowReader row reader
 type RowReader struct {
-	gslogger.Log                       // mixin logger
-	NameMapping  map[string]string     // name mapping
-	Unmarshals   map[string]UnmarshalF // unmarshal functions
-	header       *x.Row                // current row
-	row          *x.Row                // current row
-	id           int                   // row id
+	gslogger.Log                           // mixin logger
+	Sheet        string                    // sheet name
+	nameMapping  map[string]string         // name mapping
+	unmarshalers map[string]UnmarshalF     // unmarshal functions
+	pattern      map[string]*regexp.Regexp // column pattern
+	Split        string                    // split chars
+	header       *x.Row                    // current row
+	row          *x.Row                    // current row
+	id           int                       // row id
 }
 
-func (reader *Reader) newRowReader(header, row *x.Row, id int) *RowReader {
+func (reader *Reader) newRowReader(name string, header, row *x.Row, id int) *RowReader {
 	return &RowReader{
-		Log:    reader.Log,
-		header: header,
-		row:    row,
+		nameMapping:  reader.NameMapping,
+		unmarshalers: reader.Unmarshalers,
+		pattern:      reader.Pattern,
+		Log:          reader.Log,
+		Sheet:        name,
+		header:       header,
+		row:          row,
+		Split:        ",",
 	}
 }
 
@@ -61,7 +72,7 @@ func (reader *RowReader) Read(val interface{}) (err error) {
 
 	defer func() {
 		if e := recover(); e != nil {
-			err = gserrors.Newf(nil, "catch unknown err :%v", e)
+			err = gserrors.Newf(nil, "catch panic :%v", e)
 		}
 	}()
 
@@ -80,19 +91,19 @@ func (reader *RowReader) Read(val interface{}) (err error) {
 		return &ErrInvalidUnmarshal{reflect.TypeOf(val)}
 	}
 
-	valtype := reflect.Indirect(rv).Type()
-
 	rv = reflect.Indirect(rv)
 
 	for i, cell := range reader.row.Cells {
 		colname := reader.header.Cells[i].Value
+		key := fmt.Sprintf("%s.%s", reader.Sheet, colname)
 
-		if name, ok := reader.NameMapping[colname]; ok {
+		if name, ok := reader.nameMapping[key]; ok {
 			colname = name
+			key = fmt.Sprintf("%s.%s", reader.Sheet, name)
 		}
 
-		if reader.Unmarshals != nil {
-			if f, ok := reader.Unmarshals[colname]; ok {
+		if reader.unmarshalers != nil {
+			if f, ok := reader.unmarshalers[key]; ok {
 				if err := f(reflect.Indirect(rv), cell.Value); err != nil {
 					return gserrors.Newf(err, "can't conv cell[%s:%d] '%s'", colname, reader.id, cell.Value)
 				}
@@ -100,57 +111,15 @@ func (reader *RowReader) Read(val interface{}) (err error) {
 			}
 		}
 
-		fieldType, ok := valtype.FieldByName(colname)
+		field := rv.FieldByName(colname)
 
-		if !ok {
+		if !field.IsValid() {
 			reader.W("can't unmarshal col(%s)", colname)
 			continue
 		}
 
-		field := rv.FieldByName(colname)
-
-		switch fieldType.Type.Kind() {
-		case reflect.Bool:
-			val := cell.Value
-
-			if val == "true" || val == "1" {
-				field.SetBool(true)
-			} else {
-				field.SetBool(false)
-			}
-
-		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-			val, err := cell.Int64()
-
-			if err != nil {
-				return gserrors.Newf(err, "can't conv cell[%s:%d] '%s' to int", colname, reader.id, cell.Value)
-			}
-
-			field.SetInt(val)
-		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-
-			val, err := cell.Int64()
-
-			if err != nil {
-				return gserrors.Newf(err, "can't conv cell[%s:%d] '%s' to uint", colname, reader.id, cell.Value)
-			}
-
-			field.SetUint(uint64(val))
-
-		case reflect.Float32, reflect.Float64:
-
-			val, err := cell.Float()
-
-			if err != nil {
-				return gserrors.Newf(err, "can't conv cell[%s:%d] '%s' to float", colname, reader.id, cell.Value)
-			}
-
-			field.SetFloat(val)
-
-		case reflect.String:
-			field.SetString(cell.Value)
-		default:
-			reader.W("can't unmarshal col(%s)", colname)
+		if reader.readBuiltinType(key, cell.Value, field) {
+			continue
 		}
 
 	}
@@ -158,10 +127,108 @@ func (reader *RowReader) Read(val interface{}) (err error) {
 	return nil
 }
 
+func (reader *RowReader) readBuiltinType(colname string, val string, assign reflect.Value) bool {
+
+	switch assign.Type().Kind() {
+	case reflect.Bool:
+		if val == "true" || val == "1" {
+			assign.SetBool(true)
+		} else {
+			assign.SetBool(false)
+		}
+
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		v, err := strconv.ParseInt(val, 0, 64)
+
+		if err != nil {
+			gserrors.Panicf(err, "can't conv cell[%s:%d] '%s' to int", colname, reader.id, val)
+		}
+
+		assign.SetInt(v)
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+
+		v, err := strconv.ParseUint(val, 0, 64)
+
+		if err != nil {
+			gserrors.Panicf(err, "can't conv cell[%s:%d] '%s' to uint", colname, reader.id, val)
+		}
+
+		assign.SetUint(v)
+
+	case reflect.Float32, reflect.Float64:
+
+		val, err := strconv.ParseFloat(val, 64)
+
+		if err != nil {
+			gserrors.Panicf(err, "can't conv cell[%s:%d] '%s' to float", colname, reader.id, val)
+		}
+
+		assign.SetFloat(val)
+
+	case reflect.String:
+		assign.SetString(val)
+	case reflect.Array:
+	case reflect.Slice:
+
+		pattern, ok := reader.pattern[colname]
+
+		if !ok {
+			gserrors.Panicf(nil, "can't conv %s(%d), not found convert pattern", colname, reader.id)
+		}
+
+		subs := strings.Split(val, reader.Split)
+
+		slice := reflect.MakeSlice(assign.Type(), 0, len(subs))
+
+		subType := assign.Type().Elem()
+
+		if subType.Kind() == reflect.Ptr {
+			subType = subType.Elem()
+		}
+
+		for _, sub := range subs {
+			matched := pattern.FindStringSubmatch(sub)
+
+			if matched == nil {
+
+				if sub != "" {
+					gserrors.Panicf(nil, "can't conv cell[%s:%d] '%s'", colname, reader.id, val)
+				}
+
+				continue
+			}
+
+			subval := reflect.New(subType)
+
+			for i, match := range matched[1:] {
+
+				if match == "" {
+					continue
+				}
+
+				name := fmt.Sprintf("%s.%s", colname, subType.Field(i).Name)
+				reader.readBuiltinType(name, match, reflect.Indirect(subval).Field(i))
+			}
+
+			slice = reflect.Append(slice, subval)
+		}
+
+		assign.Set(slice)
+
+	default:
+		return false
+	}
+
+	return true
+}
+
 // Reader xlsx reader
 type Reader struct {
-	gslogger.Log         // mixin log
-	file         *x.File // xlsx file
+	gslogger.Log                           // mixin log
+	file         *x.File                   // xlsx file
+	Pattern      map[string]*regexp.Regexp // subtype pattern
+	Unmarshalers map[string]UnmarshalF     // unmarshal functions
+	NameMapping  map[string]string         // name mapping
 }
 
 // NewReader create new xlsx file reader
@@ -204,7 +271,7 @@ func (reader *Reader) Read(sheetName string) (rows []*RowReader) {
 	rows = make([]*RowReader, len(sheet.Rows)-1)
 
 	for i, row := range sheet.Rows[1:] {
-		rows[i] = reader.newRowReader(header, row, i)
+		rows[i] = reader.newRowReader(sheetName, header, row, i)
 	}
 
 	return

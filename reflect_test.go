@@ -9,7 +9,7 @@ import (
 type A struct{}
 
 func TestReflect(t *testing.T) {
-	var val *A
+	var val []*A
 
-	fmt.Printf("type :%v\n", reflect.ValueOf(&val).Elem().Type())
+	fmt.Printf("type :%v\n", reflect.ValueOf(val).Type().Elem())
 }
